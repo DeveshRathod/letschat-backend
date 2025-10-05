@@ -1,0 +1,8 @@
+*.env
+
+# Ignore Terraform
+terraform/
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
