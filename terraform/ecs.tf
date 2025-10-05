@@ -60,7 +60,7 @@ resource "aws_ecs_task_definition" "letschat_backend" {
         }
       ]
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+        command     = ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
         interval    = 30
         timeout     = 5
         retries     = 3
