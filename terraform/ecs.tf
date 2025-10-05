@@ -19,7 +19,7 @@ resource "aws_ecs_task_definition" "letschat_backend" {
 
   runtime_platform {
     operating_system_family = "LINUX"
-    cpu_architecture        = "AMD64"
+    cpu_architecture        = "X86_64"
   }
 
   container_definitions = jsonencode([
