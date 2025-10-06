@@ -1,0 +1,186 @@
+pipeline {
+    agent any
+
+     environment {
+        AWS_REGION    = credentials('aws-region')
+        ECR_REGISTRY  = credentials('ecr-registry')
+        REPO_NAME     = credentials('repo-name')
+        SONAR_HOST    = credentials('sonar-host')
+        SONAR_PROJECT = credentials('sonar-project')
+        TERRAFORM_DIR = credentials('terraform-dir')
+        SECRET_ARN    = credentials('secret-arn')
+        CLUSTER_NAME  = credentials('cluster-name')
+        SERVICE_NAME  = credentials('service-name')
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/DeveshRathod/letschat-backend.git'
+            }
+        }
+
+        stage('Check CLI Tools') {
+            steps {
+                sh "which aws || echo 'AWS CLI not found'"
+                sh "aws --version || true"
+                sh "docker --version"
+                sh "terraform -version || echo 'Terraform not installed'"
+            }
+        }
+
+        stage('Sonar Scan') {
+            steps {
+                script {
+                    def scannerHome = tool 'sonar'
+                    withCredentials([string(credentialsId: 'letschat_backend', variable: 'LETSCHAT_TOKEN')]) {
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${SONAR_PROJECT} \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url=${SONAR_HOST} \
+                                -Dsonar.login=${LETSCHAT_TOKEN}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Check/Create ECR Repository') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                    script {
+                        echo "🔍 Checking if ECR repository ${env.REPO_NAME} exists..."
+                        def repoExists = sh(
+                            script: """
+                                aws ecr describe-repositories \
+                                  --repository-names ${env.REPO_NAME} \
+                                  --region ${env.AWS_REGION} >/dev/null 2>&1 && echo true || echo false
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (repoExists == 'true') {
+                            echo "✅ ECR repository '${env.REPO_NAME}' already exists."
+                        } else {
+                            echo "⚙️ Creating ECR repository '${env.REPO_NAME}'..."
+                            sh """
+                                aws ecr create-repository \
+                                  --repository-name ${env.REPO_NAME} \
+                                  --region ${env.AWS_REGION}
+                            """
+                            echo "✅ ECR repository '${env.REPO_NAME}' created successfully."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    """
+                }
+            }
+        }
+        
+        stage('Ask for Image Tag') {
+            steps {
+                script {
+                    env.IMAGE_TAG = input(
+                        id: 'userInput',
+                        message: 'Enter Docker Image Tag (e.g. v1.0.1, latest):',
+                        parameters: [
+                            string(defaultValue: 'v1.0.0', description: 'Docker image tag to use', name: 'IMAGE_TAG')
+                        ]
+                    )
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "🛠️ Building Docker image..."
+                    sh "docker build -t ${ECR_REGISTRY}/${REPO_NAME}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Trivy Security Scan') {
+            steps {
+                script {
+                    echo "🔍 Running Trivy scan..."
+                    sh """
+                        docker run --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v $HOME/.cache:/root/.cache \
+                            -v ${env.WORKSPACE}:/workspace \
+                            aquasec/trivy:latest image ${ECR_REGISTRY}/${REPO_NAME}:${IMAGE_TAG} \
+                            --severity HIGH,CRITICAL \
+                            --format json --output /workspace/trivy-report.json
+                    """
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    echo "🚀 Pushing Docker image to ECR..."
+                    sh "docker push ${ECR_REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Terraform Plan & Apply') {
+            steps {
+                script {
+                    def proceed = input(
+                        id: 'deployConfirm',
+                        message: 'Do you want to deploy this image to ECS using Terraform?',
+                        parameters: [choice(choices: ['Yes', 'No'], description: 'Proceed with Terraform deploy?', name: 'Deploy')]
+                    )
+
+                    if (proceed == 'Yes') {
+                        dir("${TERRAFORM_DIR}") {
+                            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                                sh """
+                                    terraform init -input=false
+                                    terraform plan \
+                                        -var="aws_region=${AWS_REGION}" \
+                                        -var="backend_image=${ECR_REGISTRY}/${REPO_NAME}:${IMAGE_TAG}" \
+                                        -var="secret_arn=${SECRET_ARN}" \
+                                        -var="name=${SERVICE_NAME}" \
+                                        -var="cluster_name=${CLUSTER_NAME}"
+                                """
+
+                                input message: 'Apply Terraform changes?', ok: 'Apply'
+                                sh """
+                                    terraform apply -auto-approve \
+                                        -var="aws_region=${AWS_REGION}" \
+                                        -var="backend_image=${ECR_REGISTRY}/${REPO_NAME}:${IMAGE_TAG}" \
+                                        -var="secret_arn=${SECRET_ARN}" \
+                                        -var="name=${SERVICE_NAME}" \
+                                        -var="cluster_name=${CLUSTER_NAME}"
+                                """
+                            }
+                        }
+                    } else {
+                        echo "🛑 Deployment skipped by user."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "🔒 Logging out from Docker ECR..."
+            sh "docker logout ${ECR_REGISTRY} || true"
+        }
+    }
+}
